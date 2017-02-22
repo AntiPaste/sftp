@@ -36,6 +36,7 @@ type Server struct {
 	openFilesLock sync.RWMutex
 	handleCount   int
 	maxTxPacket   uint32
+	quitChan      chan bool
 	writtenFiles  chan WrittenFile
 }
 
@@ -48,7 +49,13 @@ func (svr *Server) Stop() error {
 		}
 
 		// All files closed, time to bail
-		return svr.Close()
+		if err := svr.conn.Close(); err != nil {
+			return err
+		}
+
+		// Wait for clean up
+		<-svr.quitChan
+		return nil
 	}
 }
 
@@ -126,6 +133,7 @@ func NewServer(rwc io.ReadWriteCloser, options ...ServerOption) (*Server, error)
 			},
 		},
 		debugStream: ioutil.Discard,
+		quitChan:    make(chan bool, 1),
 		pktChan:     make(chan rxPacket, sftpServerWorkerCount),
 		openFiles:   make(map[string]*writeTrackingFile),
 		maxTxPacket: 1 << 15,
@@ -461,6 +469,8 @@ func (svr *Server) Serve() error {
 		fmt.Fprintf(svr.debugStream, "sftp server file with handle %q left open: %v\n", handle, file.Name())
 		file.Close()
 	}
+
+	svr.quitChan <- true
 	return err // error from recvPacket
 }
 
