@@ -27,13 +27,46 @@ const (
 // as specified at http://tools.ietf.org/html/draft-ietf-secsh-filexfer-02
 type Server struct {
 	serverConn
+	user          string
 	debugStream   io.Writer
 	readOnly      bool
+	chroot        string
 	pktChan       chan rxPacket
-	openFiles     map[string]*os.File
+	openFiles     map[string]*writeTrackingFile
 	openFilesLock sync.RWMutex
 	handleCount   int
 	maxTxPacket   uint32
+	writtenFiles  chan WrittenFile
+}
+
+// Stop waits for all the open files to close before shutting down the server.
+func (svr *Server) Stop() error {
+	for {
+		if len(svr.openFiles) != 0 {
+			time.Sleep(1 * time.Second)
+			continue
+		}
+
+		// All files closed, time to bail
+		return svr.Close()
+	}
+}
+
+func (svr *Server) path(p string) string {
+	if svr.chroot == "" {
+		return p
+	}
+
+	chroot := svr.chroot
+	if svr.user != "" {
+		chroot = filepath.Join(chroot, svr.user)
+	}
+
+	c := filepath.Clean(p)
+	if filepath.IsAbs(c) && filepath.HasPrefix(c, chroot) {
+		return c
+	}
+	return filepath.Join(chroot, c)
 }
 
 func (svr *Server) nextHandle(f *os.File) string {
@@ -41,7 +74,7 @@ func (svr *Server) nextHandle(f *os.File) string {
 	defer svr.openFilesLock.Unlock()
 	svr.handleCount++
 	handle := strconv.Itoa(svr.handleCount)
-	svr.openFiles[handle] = f
+	svr.openFiles[handle] = &writeTrackingFile{f, false}
 	return handle
 }
 
@@ -56,11 +89,21 @@ func (svr *Server) closeHandle(handle string) error {
 	return syscall.EBADF
 }
 
-func (svr *Server) getHandle(handle string) (*os.File, bool) {
+func (svr *Server) getHandle(handle string) (*writeTrackingFile, bool) {
 	svr.openFilesLock.RLock()
 	defer svr.openFilesLock.RUnlock()
 	f, ok := svr.openFiles[handle]
 	return f, ok
+}
+
+type writeTrackingFile struct {
+	*os.File
+	written bool
+}
+
+type WrittenFile struct {
+	User string
+	Path string
 }
 
 type serverRespondablePacket interface {
@@ -84,7 +127,7 @@ func NewServer(rwc io.ReadWriteCloser, options ...ServerOption) (*Server, error)
 		},
 		debugStream: ioutil.Discard,
 		pktChan:     make(chan rxPacket, sftpServerWorkerCount),
-		openFiles:   make(map[string]*os.File),
+		openFiles:   make(map[string]*writeTrackingFile),
 		maxTxPacket: 1 << 15,
 	}
 
@@ -112,6 +155,31 @@ func WithDebug(w io.Writer) ServerOption {
 func ReadOnly() ServerOption {
 	return func(s *Server) error {
 		s.readOnly = true
+		return nil
+	}
+}
+
+// Chroot configures a Server to jail the user within a directory.
+func Chroot(p string) ServerOption {
+	return func(s *Server) error {
+		s.chroot = p
+		return nil
+	}
+}
+
+// AsUser sets the current connection user. Useful when combined with Chroot.
+func AsUser(u string) ServerOption {
+	return func(s *Server) error {
+		s.user = u
+		return nil
+	}
+}
+
+// NotifyWrite sets the channel that notifications about written files are
+// sent to.
+func NotifyWrite(c chan WrittenFile) ServerOption {
+	return func(s *Server) error {
+		s.writtenFiles = c
 		return nil
 	}
 }
@@ -216,7 +284,7 @@ func handlePacket(s *Server, p interface{}) error {
 		return s.sendPacket(sshFxVersionPacket{sftpProtocolVersion, nil})
 	case *sshFxpStatPacket:
 		// stat the requested file
-		info, err := os.Stat(p.Path)
+		info, err := os.Stat(s.path(p.Path))
 		if err != nil {
 			return s.sendError(p, err)
 		}
@@ -226,7 +294,7 @@ func handlePacket(s *Server, p interface{}) error {
 		})
 	case *sshFxpLstatPacket:
 		// stat the requested file
-		info, err := os.Lstat(p.Path)
+		info, err := os.Lstat(s.path(p.Path))
 		if err != nil {
 			return s.sendError(p, err)
 		}
@@ -251,24 +319,38 @@ func handlePacket(s *Server, p interface{}) error {
 		})
 	case *sshFxpMkdirPacket:
 		// TODO FIXME: ignore flags field
-		err := os.Mkdir(p.Path, 0755)
+		err := os.Mkdir(s.path(p.Path), 0755)
 		return s.sendError(p, err)
 	case *sshFxpRmdirPacket:
-		err := os.Remove(p.Path)
+		err := os.Remove(s.path(p.Path))
 		return s.sendError(p, err)
 	case *sshFxpRemovePacket:
-		err := os.Remove(p.Filename)
+		err := os.Remove(s.path(p.Filename))
 		return s.sendError(p, err)
 	case *sshFxpRenamePacket:
-		err := os.Rename(p.Oldpath, p.Newpath)
+		err := os.Rename(s.path(p.Oldpath), s.path(p.Newpath))
 		return s.sendError(p, err)
 	case *sshFxpSymlinkPacket:
-		err := os.Symlink(p.Targetpath, p.Linkpath)
+		err := os.Symlink(s.path(p.Targetpath), s.path(p.Linkpath))
 		return s.sendError(p, err)
 	case *sshFxpClosePacket:
+		if s.writtenFiles != nil {
+			f, ok := s.getHandle(p.Handle)
+			if !ok {
+				return s.sendError(p, syscall.EBADF)
+			}
+
+			if f.written {
+				s.writtenFiles <- WrittenFile{
+					User: s.user,
+					Path: f.Name(),
+				}
+			}
+		}
+
 		return s.sendError(p, s.closeHandle(p.Handle))
 	case *sshFxpReadlinkPacket:
-		f, err := os.Readlink(p.Path)
+		f, err := os.Readlink(s.path(p.Path))
 		if err != nil {
 			return s.sendError(p, err)
 		}
@@ -283,11 +365,22 @@ func handlePacket(s *Server, p interface{}) error {
 		})
 
 	case *sshFxpRealpathPacket:
-		f, err := filepath.Abs(p.Path)
+		f, err := filepath.Abs(s.path(p.Path))
 		if err != nil {
 			return s.sendError(p, err)
 		}
+
+		if s.chroot != "" {
+			r, err := filepath.Rel(s.path("."), f)
+			if err != nil {
+				return s.sendError(p, err)
+			}
+
+			f = string(filepath.Separator) + r
+		}
+
 		f = filepath.Clean(f)
+
 		return s.sendPacket(sshFxpNamePacket{
 			ID: p.ID,
 			NameAttrs: []sshFxpNameAttr{{
@@ -324,6 +417,7 @@ func handlePacket(s *Server, p interface{}) error {
 			return s.sendError(p, syscall.EBADF)
 		}
 
+		f.written = true
 		_, err := f.WriteAt(p.Data, int64(p.Offset))
 		return s.sendError(p, err)
 	case serverRespondablePacket:
@@ -430,7 +524,7 @@ func (p sshFxpOpenPacket) respond(svr *Server) error {
 		osFlags |= os.O_EXCL
 	}
 
-	f, err := os.OpenFile(p.Path, osFlags, 0644)
+	f, err := os.OpenFile(svr.path(p.Path), osFlags, 0644)
 	if err != nil {
 		return svr.sendError(p, err)
 	}
@@ -467,17 +561,17 @@ func (p sshFxpSetstatPacket) respond(svr *Server) error {
 	b := p.Attrs.([]byte)
 	var err error
 
-	debug("setstat name \"%s\"", p.Path)
+	debug("setstat name \"%s\"", svr.path(p.Path))
 	if (p.Flags & ssh_FILEXFER_ATTR_SIZE) != 0 {
 		var size uint64
 		if size, b, err = unmarshalUint64Safe(b); err == nil {
-			err = os.Truncate(p.Path, int64(size))
+			err = os.Truncate(svr.path(p.Path), int64(size))
 		}
 	}
 	if (p.Flags & ssh_FILEXFER_ATTR_PERMISSIONS) != 0 {
 		var mode uint32
 		if mode, b, err = unmarshalUint32Safe(b); err == nil {
-			err = os.Chmod(p.Path, os.FileMode(mode))
+			err = os.Chmod(svr.path(p.Path), os.FileMode(mode))
 		}
 	}
 	if (p.Flags & ssh_FILEXFER_ATTR_ACMODTIME) != 0 {
@@ -488,7 +582,7 @@ func (p sshFxpSetstatPacket) respond(svr *Server) error {
 		} else {
 			atimeT := time.Unix(int64(atime), 0)
 			mtimeT := time.Unix(int64(mtime), 0)
-			err = os.Chtimes(p.Path, atimeT, mtimeT)
+			err = os.Chtimes(svr.path(p.Path), atimeT, mtimeT)
 		}
 	}
 	if (p.Flags & ssh_FILEXFER_ATTR_UIDGID) != 0 {
@@ -497,7 +591,7 @@ func (p sshFxpSetstatPacket) respond(svr *Server) error {
 		if uid, b, err = unmarshalUint32Safe(b); err != nil {
 		} else if gid, b, err = unmarshalUint32Safe(b); err != nil {
 		} else {
-			err = os.Chown(p.Path, int(uid), int(gid))
+			err = os.Chown(svr.path(p.Path), int(uid), int(gid))
 		}
 	}
 
