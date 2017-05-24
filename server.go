@@ -330,11 +330,27 @@ func handlePacket(s *Server, p interface{}) error {
 		err := os.Mkdir(s.path(p.Path), 0755)
 		return s.sendError(p, err)
 	case *sshFxpRmdirPacket:
-		err := os.Remove(s.path(p.Path))
-		return s.sendError(p, err)
+		stat, err := os.Stat(s.path(p.Path))
+		if err != nil {
+			return s.sendError(p, err)
+		}
+
+		if !stat.IsDir() {
+			return s.sendError(p, errors.New("Cannot remove file, use rm"))
+		}
+
+		return s.sendError(p, os.Remove(s.path(p.Path)))
 	case *sshFxpRemovePacket:
-		err := os.Remove(s.path(p.Filename))
-		return s.sendError(p, err)
+		stat, err := os.Stat(s.path(p.Filename))
+		if err != nil {
+			return s.sendError(p, err)
+		}
+
+		if stat.IsDir() {
+			return s.sendError(p, errors.New("Cannot remove directory, use rmdir"))
+		}
+
+		return s.sendError(p, os.Remove(s.path(p.Filename)))
 	case *sshFxpRenamePacket:
 		err := os.Rename(s.path(p.Oldpath), s.path(p.Newpath))
 		return s.sendError(p, err)
