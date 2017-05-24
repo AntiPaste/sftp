@@ -339,6 +339,10 @@ func handlePacket(s *Server, p interface{}) error {
 			return s.sendError(p, errors.New("Cannot remove file, use rm"))
 		}
 
+		if s.path(p.Path) == s.chroot {
+			return s.sendError(p, errors.New("Cannot remove chroot folder"))
+		}
+
 		return s.sendError(p, os.Remove(s.path(p.Path)))
 	case *sshFxpRemovePacket:
 		stat, err := os.Stat(s.path(p.Filename))
