@@ -30,6 +30,7 @@ type Server struct {
 	user          string
 	debugStream   io.Writer
 	readOnly      bool
+	disableRemove bool
 	chroot        string
 	pktChan       chan rxPacket
 	openFiles     map[string]*writeTrackingFile
@@ -167,6 +168,14 @@ func ReadOnly() ServerOption {
 	}
 }
 
+// ReadOnly configures a Server to serve files in read-only mode.
+func DisableRemove() ServerOption {
+	return func(s *Server) error {
+		s.disableRemove = true
+		return nil
+	}
+}
+
 // Chroot configures a Server to jail the user within a directory.
 func Chroot(p string) ServerOption {
 	return func(s *Server) error {
@@ -233,6 +242,10 @@ func (svr *Server) sftpServerWorker() error {
 		case ssh_FXP_READDIR:
 			pkt = &sshFxpReaddirPacket{}
 		case ssh_FXP_REMOVE:
+			if svr.disableRemove {
+				continue
+			}
+
 			pkt = &sshFxpRemovePacket{}
 			readonly = false
 		case ssh_FXP_MKDIR:
@@ -246,6 +259,10 @@ func (svr *Server) sftpServerWorker() error {
 		case ssh_FXP_STAT:
 			pkt = &sshFxpStatPacket{}
 		case ssh_FXP_RENAME:
+			if svr.disableRemove {
+				continue
+			}
+
 			pkt = &sshFxpRenamePacket{}
 			readonly = false
 		case ssh_FXP_READLINK:
