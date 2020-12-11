@@ -213,6 +213,9 @@ func (svr *Server) sftpServerWorker() error {
 			encoding.BinaryUnmarshaler
 			id() uint32
 		}
+
+		fmt.Printf("%+v %+v", p.pktType, p)
+
 		var readonly = true
 		switch p.pktType {
 		case ssh_FXP_INIT:
